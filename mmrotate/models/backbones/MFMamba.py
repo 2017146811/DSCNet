@@ -1,0 +1,921 @@
+import re
+import time
+import math
+import numpy as np
+from functools import partial
+from typing import Optional, Union, Type, List, Tuple, Callable, Dict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
+from einops import rearrange, repeat
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
+
+from mmrotate.models.backbones.dwconv2d.Dwconv.dwconv_layer import DepthwiseFunction
+
+DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
+
+from hilbert import decode, encode
+from pyzorder import ZOrderIndexer
+
+from monai.networks.blocks.dynunet_block import UnetOutBlock
+from monai.networks.blocks.unetr_block import UnetrBasicBlock, UnetrUpBlock
+
+#八个扫描方向
+class PatchEmbed2D(nn.Module):
+    r""" Image to Patch Embedding
+    Args:
+        patch_size (int): Patch token size. Default: 4.
+        in_chans (int): Number of input image channels. Default: 3.
+        embed_dim (int): Number of linear projection output channels. Default: 96.
+        norm_layer (nn.Module, optional): Normalization layer. Default: None
+    """
+
+    def __init__(self, patch_size=4, in_chans=1, embed_dim=96, norm_layer=None, **kwargs):  # 修改通道数为1
+        super().__init__()
+        if isinstance(patch_size, int):
+            patch_size = (patch_size, patch_size)
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        if norm_layer is not None:
+            self.norm = norm_layer(embed_dim)
+        else:
+            self.norm = None
+
+    def forward(self, x):
+        # print("dsm分割后的张量的尺寸(shape):",x.shape)  # 或 tensor.size()
+        # print("dsm分割后的张量的维度数量(dim):", x.dim())
+        x = self.proj(x).permute(0, 2, 3, 1)
+        if self.norm is not None:
+            x = self.norm(x)
+        return x
+
+
+class PatchMerging2D(nn.Module):
+    r""" Patch Merging Layer.
+    Args:
+        input_resolution (tuple[int]): Resolution of input feature.
+        dim (int): Number of input channels.
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+    """
+
+    def __init__(self, dim, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.dim = dim
+        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.norm = norm_layer(4 * dim)
+
+    def forward(self, x):
+        B, H, W, C = x.shape
+
+        SHAPE_FIX = [-1, -1]
+        if (W % 2 != 0) or (H % 2 != 0):
+            print(f"Warning, x.shape {x.shape} is not match even ===========", flush=True)
+            SHAPE_FIX[0] = H // 2
+            SHAPE_FIX[1] = W // 2
+
+        x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
+        x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
+        x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
+        x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
+
+        if SHAPE_FIX[0] > 0:
+            x0 = x0[:, :SHAPE_FIX[0], :SHAPE_FIX[1], :]
+            x1 = x1[:, :SHAPE_FIX[0], :SHAPE_FIX[1], :]
+            x2 = x2[:, :SHAPE_FIX[0], :SHAPE_FIX[1], :]
+            x3 = x3[:, :SHAPE_FIX[0], :SHAPE_FIX[1], :]
+
+        x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
+        x = x.view(B, H // 2, W // 2, 4 * C)  # B H/2*W/2 4*C
+
+        x = self.norm(x)
+        x = self.reduction(x)
+
+        return x
+
+class HSCANS(nn.Module):
+    def __init__(self, dim=2, scan_type='scan', device=None):
+        super().__init__()
+        self.size = None  # 动态初始化
+        self.dim = dim
+        self.scan_type = scan_type
+        self.device = device if device is not None else torch.device("cpu")
+
+        # 初始化空 index buffer（在 encode/decode 中动态填充）
+        self.register_buffer('index_flat', torch.empty(0, dtype=torch.long))
+        self.register_buffer('index_flat_inv', torch.empty(0, dtype=torch.long))
+
+    def flat_locs_hilbert(self, locs, num_dim, num_bit):
+        ret = []
+        l = 2 ** num_bit
+        for i in range(len(locs)):
+            loc = locs[i]
+            loc_flat = 0
+            for j in range(num_dim):
+                loc_flat += loc[j] * (l ** j)
+            ret.append(loc_flat)
+        return np.array(ret).astype(np.uint64)
+
+    def update_index(self, H , W , device=None):
+        if device is None:
+            device = self.device if hasattr(self, "device") else torch.device("cpu")
+        """根据 size 生成新的 Hilbert 或扫描索引"""
+        self.size = (H,W)
+        max_num = H * W
+        indexes = np.arange(max_num).reshape(H, W)
+
+        if self.scan_type == 'sweep':
+            locs_flat = indexes
+        elif self.scan_type == 'scan':
+            # indexes = indexes.reshape(size, size)
+            for i in np.arange(1, H, step=2):
+                indexes[i, :] = indexes[i, :][::-1]
+            locs_flat = indexes.reshape(-1)
+        # elif self.scan_type == 'zorder':
+        #     zi = ZOrderIndexer((0, size - 1), (0, size - 1))
+        #     locs_flat = [zi.rc(int(z))[1] * size + zi.rc(int(z))[0] for z in indexes]
+        #     locs_flat = np.array(locs_flat)
+        # elif self.scan_type == 'zigzag':
+        #     indexes = indexes.reshape(size, size)
+        #     locs_flat = []
+        #     for i in range(2 * size - 1):
+        #         if i % 2 == 0:
+        #             for j in range(max(0, i - size + 1), min(i, size - 1) + 1):
+        #                 locs_flat.append(indexes[i - j, j])
+        #         else:
+        #             for j in range(max(0, i - size + 1), min(i, size - 1) + 1):
+        #                 locs_flat.append(indexes[j, i - j])
+        #     locs_flat = np.array(locs_flat)
+        # elif self.scan_type == 'hilbert':
+        #     bit = int(math.log2(size))
+        #     locs = decode(indexes, self.dim, bit)
+        #     locs_flat = self.flat_locs_hilbert(locs, self.dim, bit)
+        else:
+            raise Exception('invalid encoder mode')
+
+        locs_flat_inv = np.argsort(locs_flat)
+        index_flat = torch.LongTensor(locs_flat.astype(np.int64)).unsqueeze(0).unsqueeze(1).to(device)
+        index_flat_inv = torch.LongTensor(locs_flat_inv.astype(np.int64)).unsqueeze(0).unsqueeze(1).to(device)
+
+        # 更新 buffer
+        self.index_flat.data = index_flat
+        self.index_flat_inv.data = index_flat_inv
+
+    def encode(self, img):
+        B, C, L = img.shape
+        H, W = self.size
+        assert H * W == L, f"HSCANS encode: {H}×{W} ≠ {L}"
+
+        return torch.zeros_like(img).scatter(2, self.index_flat_inv.expand(B, C, L), img)
+
+    def decode(self, img):
+        B, C, L = img.shape
+        H, W = self.size
+        assert H * W == L, f"HSCANS decode: {H}×{W} ≠ {L}"
+
+        return torch.zeros_like(img).scatter(2, self.index_flat.expand(B, C, L), img)
+
+    def __call__(self, img):
+        return self.encode(img)
+
+    def to(self, device):
+        self.device = device
+        super().to(device)
+        return self
+class StateFusion(nn.Module):
+    def __init__(self, dim):
+        super(StateFusion, self).__init__()
+        self.dim = dim
+        self.kernel_3   = nn.Parameter(torch.ones(dim, 1, 3, 3))
+        self.kernel_3_1 = nn.Parameter(torch.ones(dim, 1, 3, 3))
+        self.kernel_3_2 = nn.Parameter(torch.ones(dim, 1, 3, 3))
+        self.alpha = nn.Parameter(torch.ones(3), requires_grad=True)
+
+    @staticmethod
+    def padding(input_tensor, padding):
+        return torch.nn.functional.pad(input_tensor, padding, mode='replicate')
+
+    def forward(self, h):
+        alpha_soft = torch.softmax(self.alpha, dim=0)  # 🔥 Softmax 权重归一化
+
+        if self.training:
+            h1 = F.conv2d(self.padding(h, (1,1,1,1)), self.kernel_3,   padding=0, dilation=1, groups=self.dim)
+            h2 = F.conv2d(self.padding(h, (3,3,3,3)), self.kernel_3_1, padding=0, dilation=3, groups=self.dim)
+            h3 = F.conv2d(self.padding(h, (5,5,5,5)), self.kernel_3_2, padding=0, dilation=5, groups=self.dim)
+            out = alpha_soft[0]*h1 + alpha_soft[1]*h2 + alpha_soft[2]*h3
+            return out
+
+        else:
+            if not hasattr(self, "_merge_weight"):
+                self._merge_weight = torch.zeros((self.dim, 1, 11, 11), device=h.device)
+
+                # 用 softmax 归一化后的 alpha 权重进行合并
+                self._merge_weight[:, :, 4:7, 4:7] = alpha_soft[0]*self.kernel_3
+
+                self._merge_weight[:, :, 2:3, 2:3] = alpha_soft[1]*self.kernel_3_1[:,:,0:1,0:1]
+                self._merge_weight[:, :, 2:3, 5:6] = alpha_soft[1]*self.kernel_3_1[:,:,0:1,1:2]
+                self._merge_weight[:, :, 2:3, 8:9] = alpha_soft[1]*self.kernel_3_1[:,:,0:1,2:3]
+                self._merge_weight[:, :, 5:6, 2:3] = alpha_soft[1]*self.kernel_3_1[:,:,1:2,0:1]
+                self._merge_weight[:, :, 5:6, 5:6] += alpha_soft[1]*self.kernel_3_1[:,:,1:2,1:2]
+                self._merge_weight[:, :, 5:6, 8:9] = alpha_soft[1]*self.kernel_3_1[:,:,1:2,2:3]
+                self._merge_weight[:, :, 8:9, 2:3] = alpha_soft[1]*self.kernel_3_1[:,:,2:3,0:1]
+                self._merge_weight[:, :, 8:9, 5:6] = alpha_soft[1]*self.kernel_3_1[:,:,2:3,1:2]
+                self._merge_weight[:, :, 8:9, 8:9] = alpha_soft[1]*self.kernel_3_1[:,:,2:3,2:3]
+
+                self._merge_weight[:, :, 0:1, 0:1] = alpha_soft[2]*self.kernel_3_2[:,:,0:1,0:1]
+                self._merge_weight[:, :, 0:1, 5:6] = alpha_soft[2]*self.kernel_3_2[:,:,0:1,1:2]
+                self._merge_weight[:, :, 0:1, 10:11] = alpha_soft[2]*self.kernel_3_2[:,:,0:1,2:3]
+                self._merge_weight[:, :, 5:6, 0:1] = alpha_soft[2]*self.kernel_3_2[:,:,1:2,0:1]
+                self._merge_weight[:, :, 5:6, 5:6] += alpha_soft[2]*self.kernel_3_2[:,:,1:2,1:2]
+                self._merge_weight[:, :, 5:6, 10:11] = alpha_soft[2]*self.kernel_3_2[:,:,1:2,2:3]
+                self._merge_weight[:, :, 10:11, 0:1] = alpha_soft[2]*self.kernel_3_2[:,:,2:3,0:1]
+                self._merge_weight[:, :, 10:11, 5:6] = alpha_soft[2]*self.kernel_3_2[:,:,2:3,1:2]
+                self._merge_weight[:, :, 10:11, 10:11] = alpha_soft[2]*self.kernel_3_2[:,:,2:3,2:3]
+
+            out = DepthwiseFunction.apply(h, self._merge_weight, None, 11//2, 11//2, False)
+            return out
+
+class SS2D(nn.Module):
+    def __init__(
+            self,
+            d_model,
+            d_state=16,
+            d_conv=3,
+            expand=2.,
+            dt_rank="auto",
+            dt_min=0.001,
+            dt_max=0.1,
+            dt_init="random",
+            dt_scale=1.0,
+            dt_init_floor=1e-4,
+            dropout=0.,
+            conv_bias=True,
+            bias=False,
+            device=None,
+            dtype=None,
+            size=8,
+            scan_type='scan',
+            num_direction=8,
+            **kwargs,
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.scan_type = scan_type
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = int(self.expand * self.d_model)
+        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
+        self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
+        self.conv2d = nn.Conv2d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            groups=self.d_inner,
+            bias=conv_bias,
+            kernel_size=d_conv,
+            padding=(d_conv - 1) // 2,
+            **factory_kwargs,
+        )
+        self.act = nn.SiLU()
+        self.num_direction = num_direction
+
+        x_proj_weight = [nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs).weight for _ in range(self.num_direction)]
+        self.x_proj_weight = nn.Parameter(torch.stack(x_proj_weight, dim=0))
+        dt_projs = [self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor, **factory_kwargs) for _ in range(self.num_direction)]
+        self.dt_projs_weight = nn.Parameter(torch.stack([dt_proj.weight for dt_proj in dt_projs], dim=0))
+        self.dt_projs_bias = nn.Parameter(torch.stack([dt_proj.bias for dt_proj in dt_projs], dim=0))
+
+        self.A_logs = self.A_log_init(self.d_state, self.d_inner, copies=self.num_direction, merge=True)  # (K=4, D, N)
+        self.Ds = self.D_init(self.d_inner, copies=self.num_direction, merge=True)  # (K=4, D, N)
+
+        self.out_norm = nn.LayerNorm(self.d_inner)
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        self.dropout = nn.Dropout(dropout) if dropout > 0. else None
+        self.scans = HSCANS(scan_type=scan_type, device=self.device)
+
+        self.state_fusion = StateFusion(self.d_inner)  # d_inner 通道匹配没问题
+
+    @staticmethod
+    def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4,
+                **factory_kwargs):
+        dt_proj = nn.Linear(dt_rank, d_inner, bias=True, **factory_kwargs)
+        # Initialize special dt projection to preserve variance at initialization
+        dt_init_std = dt_rank ** -0.5 * dt_scale
+        if dt_init == "constant":
+            nn.init.constant_(dt_proj.weight, dt_init_std)
+        elif dt_init == "random":
+            nn.init.uniform_(dt_proj.weight, -dt_init_std, dt_init_std)
+        else:
+            raise NotImplementedError
+        # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
+        dt = torch.exp(
+            torch.rand(d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            dt_proj.bias.copy_(inv_dt)
+        # Our initialization would set all Linear.bias to zero, need to mark this one as _no_reinit
+        dt_proj.bias._no_reinit = True
+        return dt_proj
+
+    @staticmethod
+    def A_log_init(d_state, d_inner, copies=1, device=None, merge=True):
+        # S4D real initialization
+        A = repeat(
+            torch.arange(1, d_state + 1, dtype=torch.float32, device=device),
+            "n -> d n",
+            d=d_inner,
+        ).contiguous()
+        A_log = torch.log(A)  # Keep A_log in fp32
+        if copies > 1:
+            A_log = repeat(A_log, "d n -> r d n", r=copies)
+            if merge:
+                A_log = A_log.flatten(0, 1)
+        A_log = nn.Parameter(A_log)
+        A_log._no_weight_decay = True
+        return A_log
+
+    @staticmethod
+    def D_init(d_inner, copies=1, device=None, merge=True):
+        # D "skip" parameter
+        D = torch.ones(d_inner, device=device)
+        if copies > 1:
+            D = repeat(D, "n1 -> r n1", r=copies)
+            if merge:
+                D = D.flatten(0, 1)
+        D = nn.Parameter(D)  # Keep in fp32
+        D._no_weight_decay = True
+        return D
+
+    def forward_core(self, x: torch.Tensor):
+        self.selective_scan = selective_scan_fn
+        B, C, H, W = x.shape
+        L = H * W
+        K = self.num_direction
+        xs = []
+        if K >= 2:
+            xs.append(self.scans.encode(x.view(B, -1, L)))
+        if K >= 4:
+            xs.append(self.scans.encode(torch.transpose(x, dim0=2, dim1=3).contiguous().view(B, -1, L)))
+        if K >= 8:
+            xs.append(self.scans.encode(torch.rot90(x, k=1, dims=(2, 3)).contiguous().view(B, -1, L)))
+            xs.append(self.scans.encode(torch.transpose(torch.rot90(x, k=1, dims=(2, 3)), dim0=2, dim1=3).contiguous().view(B, -1, L)))
+        xs = torch.stack(xs,dim=1).view(B, K // 2, -1, L)
+        xs = torch.cat([xs, torch.flip(xs, dims=[-1])], dim=1)
+
+        x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
+        dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
+        dts = torch.einsum("b k r l, k d r -> b k d l", dts.view(B, K, -1, L), self.dt_projs_weight)
+
+        xs = xs.float().view(B, -1, L)  # (b, k * d, l)
+        dts = dts.contiguous().float().view(B, -1, L)  # (b, k * d, l)
+        Bs = Bs.float().view(B, K, -1, L)  # (b, k, d_state, l)
+        Cs = Cs.float().view(B, K, -1, L)  # (b, k, d_state, l)
+        Ds = self.Ds.float().view(-1)  # (k * d)
+        As = -torch.exp(self.A_logs.float()).view(-1, self.d_state)  # (k * d, d_state)
+        dt_projs_bias = self.dt_projs_bias.float().view(-1)  # (k * d)
+
+        out_y = self.selective_scan(
+            xs, dts,
+            As, Bs, Cs, Ds, z=None,
+            delta_bias=dt_projs_bias,
+            delta_softplus=True,
+            return_last_state=False,
+        ).view(B, K, -1, L)
+        assert out_y.dtype == torch.float
+        # out_y = xs
+
+        inv_y = torch.flip(out_y[:, K // 2:K], dims=[-1]).view(B, K // 2, -1, L)
+        ys = []
+        if K >= 2:
+            ys.append(self.scans.decode(out_y[:, 0]))
+            ys.append(self.scans.decode(inv_y[:, 0]))
+        if K >= 4:
+            ys.append(torch.transpose(self.scans.decode(out_y[:, 1]).view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L))
+            ys.append(torch.transpose(self.scans.decode(inv_y[:, 1]).view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L))
+        if K >= 8:
+            ys.append(torch.rot90(self.scans.decode(out_y[:, 2]).view(B, -1, W, H), k=3, dims=(2,3)).contiguous().view(B, -1, L))
+            ys.append(torch.rot90(self.scans.decode(inv_y[:, 2]).view(B, -1, W, H), k=3, dims=(2,3)).contiguous().view(B, -1, L))
+            ys.append(torch.rot90(torch.transpose(self.scans.decode(out_y[:, 3]).view(B, -1, W, H), dim0=2, dim1=3), k=3, dims=(2,3)).contiguous().view(B, -1, L))
+            ys.append(torch.rot90(torch.transpose(self.scans.decode(inv_y[:, 3]).view(B, -1, W, H), dim0=2, dim1=3), k=3, dims=(2,3)).contiguous().view(B, -1, L))
+        y = sum(ys)
+        y_2d = y.view(B, -1, H, W)
+        y_fused = self.state_fusion(y_2d)
+        y = y_fused.view(B, -1, L)
+        return y
+
+    def forward(self, x: torch.Tensor, **kwargs):
+        B, H, W, C = x.shape
+        # 动态计算 size，确保与 H, W 匹配
+        device = x.device
+        if not hasattr(self, 'scans') or self.scans is None:
+            self.scans = HSCANS(scan_type=self.scan_type, device=device)
+        self.scans.update_index(H, W , device=device)
+        self.scans.to(device)
+            # 调试信息
+        xz = self.in_proj(x)
+        x, z = xz.chunk(2, dim=-1)  # (b, h, w, d)
+        x = x.permute(0, 3, 1, 2).contiguous()
+        x = self.act(self.conv2d(x))  # (b, d, h, w)
+        y = self.forward_core(x)
+        y = torch.transpose(y, dim0=1, dim1=2).contiguous().view(B, H, W, -1)
+        y = self.out_norm(y)
+        y = y * F.silu(z)
+        out = self.out_proj(y)
+        if self.dropout is not None:
+            out = self.dropout(out)
+        return out
+# class SS2D(nn.Module):
+#     def __init__(
+#             self,
+#             d_model,
+#             d_state=16,
+#             d_conv=3,
+#             expand=2,
+#             dt_rank="auto",
+#             dt_min=0.001,
+#             dt_max=0.1,
+#             dt_init="random",
+#             dt_scale=1.0,
+#             dt_init_floor=1e-4,
+#             dropout=0.,
+#             conv_bias=True,
+#             bias=False,
+#             device=None,
+#             dtype=None,
+#             **kwargs,
+#     ):
+#         factory_kwargs = {"device": device, "dtype": dtype}
+#         super().__init__()
+#         self.d_model = d_model
+#         self.d_state = d_state
+#         self.d_conv = d_conv
+#         self.expand = expand
+#         self.d_inner = int(self.expand * self.d_model)
+#         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
+#
+#         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
+#         self.conv2d = nn.Conv2d(
+#             in_channels=self.d_inner,
+#             out_channels=self.d_inner,
+#             groups=self.d_inner,
+#             bias=conv_bias,
+#             kernel_size=d_conv,
+#             padding=(d_conv - 1) // 2,
+#             **factory_kwargs,
+#         )
+#         self.act = nn.SiLU()
+#
+#         self.x_proj = (
+#             nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
+#             nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
+#             nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
+#             nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
+#         )
+#         self.x_proj_weight = nn.Parameter(torch.stack([t.weight for t in self.x_proj], dim=0))  # (K=4, N, inner)
+#         del self.x_proj
+#
+#         self.dt_projs = (
+#             self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor,
+#                          **factory_kwargs),
+#             self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor,
+#                          **factory_kwargs),
+#             self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor,
+#                          **factory_kwargs),
+#             self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor,
+#                          **factory_kwargs),
+#         )
+#         self.dt_projs_weight = nn.Parameter(torch.stack([t.weight for t in self.dt_projs], dim=0))  # (K=4, inner, rank)
+#         self.dt_projs_bias = nn.Parameter(torch.stack([t.bias for t in self.dt_projs], dim=0))  # (K=4, inner)
+#         del self.dt_projs
+#
+#         self.A_logs = self.A_log_init(self.d_state, self.d_inner, copies=4, merge=True)  # (K=4, D, N)
+#         self.Ds = self.D_init(self.d_inner, copies=4, merge=True)  # (K=4, D, N)
+#
+#         self.selective_scan = selective_scan_fn
+#
+#         self.out_norm = nn.LayerNorm(self.d_inner)
+#         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+#         self.dropout = nn.Dropout(dropout) if dropout > 0. else None
+#
+#     @staticmethod
+#     def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4,
+#                 **factory_kwargs):
+#         dt_proj = nn.Linear(dt_rank, d_inner, bias=True, **factory_kwargs)
+#
+#         # Initialize special dt projection to preserve variance at initialization
+#         dt_init_std = dt_rank ** -0.5 * dt_scale
+#         if dt_init == "constant":
+#             nn.init.constant_(dt_proj.weight, dt_init_std)
+#         elif dt_init == "random":
+#             nn.init.uniform_(dt_proj.weight, -dt_init_std, dt_init_std)
+#         else:
+#             raise NotImplementedError
+#
+#         # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
+#         dt = torch.exp(
+#             torch.rand(d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+#             + math.log(dt_min)
+#         ).clamp(min=dt_init_floor)
+#         # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+#         inv_dt = dt + torch.log(-torch.expm1(-dt))
+#         with torch.no_grad():
+#             dt_proj.bias.copy_(inv_dt)
+#         # Our initialization would set all Linear.bias to zero, need to mark this one as _no_reinit
+#         dt_proj.bias._no_reinit = True
+#
+#         return dt_proj
+#
+#     @staticmethod
+#     def A_log_init(d_state, d_inner, copies=1, device=None, merge=True):
+#         # S4D real initialization
+#         A = repeat(
+#             torch.arange(1, d_state + 1, dtype=torch.float32, device=device),
+#             "n -> d n",
+#             d=d_inner,
+#         ).contiguous()
+#         A_log = torch.log(A)  # Keep A_log in fp32
+#         if copies > 1:
+#             A_log = repeat(A_log, "d n -> r d n", r=copies)
+#             if merge:
+#                 A_log = A_log.flatten(0, 1)
+#         A_log = nn.Parameter(A_log)
+#         A_log._no_weight_decay = True
+#         return A_log
+#
+#     @staticmethod
+#     def D_init(d_inner, copies=1, device=None, merge=True):
+#         # D "skip" parameter
+#         D = torch.ones(d_inner, device=device)
+#         if copies > 1:
+#             D = repeat(D, "n1 -> r n1", r=copies)
+#             if merge:
+#                 D = D.flatten(0, 1)
+#         D = nn.Parameter(D)  # Keep in fp32
+#         D._no_weight_decay = True
+#         return D
+#     # @staticmethod
+#     # def generate_spiral_indices(H, W, mode='outward_cw'):#circle-mamba
+#     #     visited = [[False] * W for _ in range(H)]
+#     #     result = []
+#     #     if 'inward' in mode:
+#     #         dirs = [(0, 1), (1, 0), (0, -1), (-1, 0)] if 'cw' in mode else [(1, 0), (0, 1), (-1, 0), (0, -1)]
+#     #         x, y = 0, 0
+#     #     else:
+#     #         dirs = [(0, 1), (1, 0), (0, -1), (-1, 0)] if 'cw' in mode else [(1, 0), (0, 1), (-1, 0), (0, -1)]
+#     #         x, y = H // 2, W // 2 if W % 2 else W // 2 - 1
+#     #
+#     #     total = H * W
+#     #     dir_idx = 0
+#     #     steps = 1
+#     #     while len(result) < total:
+#     #         for _ in range(2):
+#     #             dx, dy = dirs[dir_idx % 4]
+#     #             for _ in range(steps):
+#     #                 if 0 <= x < H and 0 <= y < W and not visited[x][y]:
+#     #                     result.append((x, y))
+#     #                     visited[x][y] = True
+#     #                 x += dx
+#     #                 y += dy
+#     #             dir_idx += 1
+#     #         steps += 1
+#     #     return result[:H * W]
+#     #
+#     # @staticmethod
+#     # def spiral_scan(x, indices):#circle-mamba
+#     #     B, C, H, W = x.shape
+#     #     device = x.device
+#     #     flat_idx = [i * W + j for i, j in indices]
+#     #     x_flat = x.view(B, C, -1)
+#     #     return x_flat[:, :, flat_idx]  # (B, C, L)
+#     # def forward_core(self, x: torch.Tensor):#circle-mamba
+#     #     B, C, H, W = x.shape
+#     #     L = H * W
+#     #     K = 4
+#     #
+#     #     idx_xi1 = self.generate_spiral_indices(H, W, mode='outward_cw')
+#     #     idx_xi2 = self.generate_spiral_indices(H, W, mode='outward_ccw')
+#     #     idx_xi3 = self.generate_spiral_indices(H, W, mode='inward_cw')
+#     #     idx_xi4 = self.generate_spiral_indices(H, W, mode='inward_ccw')
+#     #
+#     #     x1 = self.spiral_scan(x, idx_xi1)
+#     #     x2 = self.spiral_scan(x, idx_xi2)
+#     #     x3 = self.spiral_scan(x, idx_xi3)
+#     #     x4 = self.spiral_scan(x, idx_xi4)
+#     #
+#     #     xs = torch.stack([x1, x2, x3, x4], dim=1)  # (B, 4, C, L)
+#     #
+#     #     x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
+#     #     dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
+#     #     dts = torch.einsum("b k r l, k d r -> b k d l", dts.view(B, K, -1, L), self.dt_projs_weight)
+#     #
+#     #     xs = xs.float().view(B, -1, L)
+#     #     dts = dts.contiguous().float().view(B, -1, L)
+#     #     Bs = Bs.float().view(B, K, -1, L)
+#     #     Cs = Cs.float().view(B, K, -1, L)
+#     #     Ds = self.Ds.float().view(-1)
+#     #     As = -torch.exp(self.A_logs.float()).view(-1, self.d_state)
+#     #     dt_projs_bias = self.dt_projs_bias.float().view(-1)
+#     #
+#     #     out_y = self.selective_scan(
+#     #         xs, dts,
+#     #         As, Bs, Cs, Ds, z=None,
+#     #         delta_bias=dt_projs_bias,
+#     #         delta_softplus=True,
+#     #         return_last_state=False,
+#     #     ).view(B, K, -1, L)
+#     #     assert out_y.dtype == torch.float
+#     #     # y = out_y.sum(dim=1)
+#     #
+#     #
+#     #     inv_y = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
+#     #     wh_y = torch.transpose(out_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
+#     #     invwh_y = torch.transpose(inv_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
+#     #     return out_y[:, 0], inv_y[:, 0], wh_y, invwh_y
+#
+#     def forward_core(self, x: torch.Tensor):#vmamba
+#         B, C, H, W = x.shape
+#         L = H * W
+#         K = 4
+#
+#         x_hwwh = torch.stack([x.view(B, -1, L), torch.transpose(x, dim0=2, dim1=3).contiguous().view(B, -1, L)],
+#                              dim=1).view(B, 2, -1, L)
+#         xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1)  # (b, k, d, l)
+#
+#         x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
+#         dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
+#         dts = torch.einsum("b k r l, k d r -> b k d l", dts.view(B, K, -1, L), self.dt_projs_weight)
+#
+#         xs = xs.float().view(B, -1, L)  # (b, k * d, l)
+#         dts = dts.contiguous().float().view(B, -1, L)  # (b, k * d, l)
+#         Bs = Bs.float().view(B, K, -1, L)  # (b, k, d_state, l)
+#         Cs = Cs.float().view(B, K, -1, L)  # (b, k, d_state, l)
+#         Ds = self.Ds.float().view(-1)  # (k * d)
+#         As = -torch.exp(self.A_logs.float()).view(-1, self.d_state)  # (k * d, d_state)
+#         dt_projs_bias = self.dt_projs_bias.float().view(-1)  # (k * d)
+#
+#         out_y = self.selective_scan(
+#             xs, dts,
+#             As, Bs, Cs, Ds, z=None,
+#             delta_bias=dt_projs_bias,
+#             delta_softplus=True,
+#             return_last_state=False,
+#         ).view(B, K, -1, L)
+#         assert out_y.dtype == torch.float
+#
+#         inv_y = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
+#         wh_y = torch.transpose(out_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
+#         invwh_y = torch.transpose(inv_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
+#
+#         return out_y[:, 0], inv_y[:, 0], wh_y, invwh_y
+#
+#     def forward(self, x: torch.Tensor, **kwargs):
+#         B, H, W, C = x.shape
+#
+#         xz = self.in_proj(x)
+#         x, z = xz.chunk(2, dim=-1)  # (b, h, w, d)
+#
+#         x = x.permute(0, 3, 1, 2).contiguous()
+#         x = self.act(self.conv2d(x))  # (b, d, h, w)
+#         y1, y2, y3, y4 = self.forward_core(x)
+#         assert y1.dtype == torch.float32
+#         y = y1 + y2 + y3 + y4
+#         y = torch.transpose(y, dim0=1, dim1=2).contiguous().view(B, H, W, -1)
+#         y = self.out_norm(y)
+#         y = y * F.silu(z)
+#         out = self.out_proj(y)
+#         if self.dropout is not None:
+#             out = self.dropout(out)
+#         return out
+#
+#
+class VSSBlock(nn.Module):
+    def __init__(
+            self,
+            hidden_dim: int = 0,
+            drop_path: float = 0,
+            norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+            attn_drop_rate: float = 0,
+            d_state: int = 16,
+            **kwargs,
+    ):
+        super().__init__()
+        self.ln_1 = norm_layer(hidden_dim)
+        self.self_attention = SS2D(d_model=hidden_dim, dropout=attn_drop_rate, d_state=d_state, **kwargs)
+        self.drop_path = DropPath(drop_path)
+
+    def forward(self, input: torch.Tensor):
+        x = input + self.drop_path(self.self_attention(self.ln_1(input)))
+        return x
+
+
+class VSSLayer(nn.Module):
+    """ A basic layer for one stage.
+    Args:
+        dim (int): Number of input channels.
+        depth (int): Number of blocks.
+        drop (float, optional): Dropout rate. Default: 0.0
+        attn_drop (float, optional): Attention dropout rate. Default: 0.0
+        drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
+        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
+        downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
+    """
+
+    def __init__(
+            self,
+            dim,
+            depth,
+            attn_drop=0.,
+            drop_path=0.,
+            norm_layer=nn.LayerNorm,
+            downsample=None,
+            use_checkpoint=False,
+            d_state=16,
+            **kwargs,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.use_checkpoint = use_checkpoint
+
+        self.blocks = nn.ModuleList([
+            VSSBlock(
+                hidden_dim=dim,
+                drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                norm_layer=norm_layer,
+                attn_drop_rate=attn_drop,
+                d_state=d_state,
+            )
+            for i in range(depth)])
+
+        if True:  # is this really applied? Yes, but been overriden later in VSSM!
+            def _init_weights(module: nn.Module):
+                for name, p in module.named_parameters():
+                    if name in ["out_proj.weight"]:
+                        p = p.clone().detach_()  # fake init, just to keep the seed ....
+                        nn.init.kaiming_uniform_(p, a=math.sqrt(5))
+
+            self.apply(_init_weights)
+
+        if downsample is not None:
+            self.downsample = downsample(dim=dim, norm_layer=norm_layer)
+        else:
+            self.downsample = None
+
+    def forward(self, x):
+        for blk in self.blocks:
+            if self.use_checkpoint:
+                x = checkpoint.checkpoint(blk, x)
+            else:
+                x = blk(x)
+
+        if self.downsample is not None:
+            x = self.downsample(x)
+
+        return x
+
+
+class VSSMEncoder(nn.Module):
+    def __init__(self, patch_size=4, in_chans=3, depths=[2, 2, 9, 2],
+                 dims=[96, 192, 384, 768], d_state=16, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.2,
+                 norm_layer=nn.LayerNorm, patch_norm=True,
+                 use_checkpoint=False, **kwargs):
+        super().__init__()
+        self.num_layers = len(depths)
+        if isinstance(dims, int):
+            dims = [int(dims * 2 ** i_layer) for i_layer in range(self.num_layers)]
+        self.embed_dim = dims[0]
+        self.num_features = dims[-1]
+        self.dims = dims
+
+        # PatchEmbed2D
+        self.patch_embed = PatchEmbed2D(patch_size=patch_size, in_chans=in_chans, embed_dim=self.embed_dim,
+                                        norm_layer=norm_layer if patch_norm else None)
+
+        # WASTED absolute position embedding ======================
+        self.ape = False
+        if self.ape:
+            self.patches_resolution = self.patch_embed.patches_resolution
+            self.absolute_pos_embed = nn.Parameter(torch.zeros(1, *self.patches_resolution, self.embed_dim))
+            trunc_normal_(self.absolute_pos_embed, std=.02)
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
+
+        self.layers = nn.ModuleList()
+        self.downsamples = nn.ModuleList()
+        for i_layer in range(self.num_layers):
+            layer = VSSLayer(
+                dim=dims[i_layer],
+                depth=depths[i_layer],
+                d_state=math.ceil(dims[0] / 6) if d_state is None else d_state,  # 20240109
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                norm_layer=norm_layer,
+                downsample=None,
+                use_checkpoint=use_checkpoint,
+            )
+            self.layers.append(layer)
+            if i_layer < self.num_layers - 1:
+                self.downsamples.append(PatchMerging2D(dim=dims[i_layer], norm_layer=norm_layer))
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m: nn.Module):
+        """
+        out_proj.weight which is previously initilized in VSSBlock, would be cleared in nn.Linear
+        no fc.weight found in the any of the model parameters
+        no nn.Embedding found in the any of the model parameters
+        so the thing is, VSSBlock initialization is useless
+
+        Conv2D is not intialized !!!
+        """
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'absolute_pos_embed'}
+
+    @torch.jit.ignore
+    def no_weight_decay_keywords(self):
+        return {'relative_position_bias_table'}
+
+    def forward(self, x):
+        x_ret = []
+        x_ret.append(x)
+
+        x = self.patch_embed(x)
+        print('分割后的的rgb:', x.shape)
+        if self.ape:
+            x = x + self.absolute_pos_embed
+        x = self.pos_drop(x)
+
+        for s, layer in enumerate(self.layers):
+            x = layer(x)
+            x_ret.append(x.permute(0, 3, 1, 2))
+            if s < len(self.downsamples):
+                x = self.downsamples[s](x)
+
+        return x_ret
+
+
+def load_pretrained_ckpt(
+        model,
+        ckpt_path="./pretrain/vmamba_tiny_e292.pth"
+):
+    print(f"Loading weights from: {ckpt_path}")
+    skip_params = ["norm.weight", "norm.bias", "head.weight", "head.bias",
+                   "patch_embed.proj.weight", "patch_embed.proj.bias",
+                   "patch_embed.norm.weight", "patch_embed.norm.weight"]
+
+    ckpt = torch.load(ckpt_path, map_location='cpu')
+    model_dict = model.state_dict()
+    for k, v in ckpt['model'].items():
+        if k in skip_params:
+            print(f"Skipping weights: {k}")
+            continue
+        kr = f"vssm_encoder.{k}"
+        if "downsample" in kr:
+            i_ds = int(re.findall(r"layers\.(\d+)\.downsample", kr)[0])
+            kr = kr.replace(f"layers.{i_ds}.downsample", f"downsamples.{i_ds}")
+            assert kr in model_dict.keys()
+        if kr in model_dict.keys():
+            assert v.shape == model_dict[kr].shape, f"Shape mismatch: {v.shape} vs {model_dict[kr].shape}"
+            model_dict[kr] = v
+        else:
+            print(f"Passing weights: {k}")
+
+    model.load_state_dict(model_dict)
+    print('Load vmamba_tiny_e292 Done!')
+
+    return model
+
+# model = SwinUMamba(
+#     in_chans=3,
+#     out_chans=6,
+#     feat_size=[48, 96, 192, 384, 768],
+#     deep_supervision=True,
+#     hidden_size=768,
+# )
+# model = load_pretrained_ckpt(model)
+
+# params = 0
+# for name, param in model.named_parameters():
+#     params += param.nelement()
+# print(params)
+
+# data = torch.randn(2,3,256,256).to("cuda")
+# print(model(data).shape)
